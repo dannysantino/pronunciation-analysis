@@ -3,7 +3,6 @@ import asyncio
 import aiohttp
 import json
 import base64
-import numpy as np
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse
@@ -17,13 +16,95 @@ load_dotenv()
 
 app = FastAPI()
 
-openai_key = os.getenv("OPENAI_API_KEY")
-speech_key = os.getenv("AZURE_SPEECH_KEY")
-azure_region = os.getenv("AZURE_REGION")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_SERVICE_REGION = os.getenv("AZURE_SERVICE_REGION")
+TWILIO_NUMBER_SID = os.getenv("TWILIO_NUMBER_SID")
 
-system_message = """
-You are a helpful language learning voice assistant. Your job is to engage the user in an interesting conversation to help them improve their pronunciation. If the user speaks in a non-English language, you should respond in a standard accent or dialect they might find familiar. Keep your responses as short as possible.
-"""
+system_message = (
+    "You are a helpful language learning voice assistant. "
+    "Your job is to engage the user in an interesting conversation to help them improve their pronunciation. "
+    "If the user speaks in a non-English language, you should respond in a standard accent or dialect they might find familiar. "
+    "Keep your responses as short as possible."
+)
+
+class AzureSpeechRecognizer:
+    def __init__(self):
+        speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SERVICE_REGION)
+
+        # set up audio input stream
+        audio_format = speechsdk.audio.AudioStreamFormat(
+            samples_per_second=8000,
+            bits_per_sample=16,
+            channels=1,
+            wave_stream_format=speechsdk.AudioStreamWaveFormat.MULAW
+        )
+        self.stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
+        audio_config = speechsdk.audio.AudioConfig(stream=self.stream)
+
+        # instantiate the speech recognizer
+        self.speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
+        self.recognition_done = asyncio.Event()
+        
+        # configure pronunciation assessment
+        pronunciation_config = speechsdk.PronunciationAssessmentConfig(
+            grading_system=speechsdk.PronunciationAssessmentGradingSystem.HundredMark,
+            granularity=speechsdk.PronunciationAssessmentGranularity.Phoneme,
+            enable_miscue=True
+        )
+        # if language == "en-US":
+        pronunciation_config.enable_prosody_assessment()
+        pronunciation_config.apply_to(self.speech_recognizer)
+        print("Azure speech recognizer configured")
+
+        # define callbacks to signal events fired by the speech recognizer
+        self.speech_recognizer.recognizing.connect(lambda evt: print(f"Recognizing: {evt.result.text}"))
+        self.speech_recognizer.recognized.connect(self.recognized_cb)
+        self.speech_recognizer.session_started.connect(lambda evt: print(f"Azure session started: {evt.session_id}"))
+        self.speech_recognizer.session_stopped.connect(self.stopped_cb)
+        self.speech_recognizer.canceled.connect(self.canceled_cb)
+
+    def start_recognition(self):
+        result_future = self.speech_recognizer.start_continuous_recognition_async()
+        print("Speech recognizer started")
+        result_future.get()
+
+    def stop_recognition(self):
+        self.speech_recognizer.stop_continuous_recognition_async()
+
+    async def send_to_azure(self, audio):
+        try:
+            self.stream.write(audio)
+        except Exception as e:
+            print(f"Error writing to Azure stream: {e}")
+
+    # callback if speech is recognized
+    def recognized_cb(self, evt: speechsdk.RecognitionEventArgs):
+        if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            print(f"Pronunciation assessment for: {evt.result.text}")
+            pronunciation_result = speechsdk.PronunciationAssessmentResult(evt.result)
+            print(
+                f"Accuracy: {pronunciation_result.accuracy_score} \n\n"
+                f"Prosody score: {pronunciation_result.prosody_score} \n\n"
+                f"Pronunciation score: {pronunciation_result.pronunciation_score} \n\n"
+                f"Completeness score: {pronunciation_result.completeness_score} \n\n"
+                f"Fluency score: {pronunciation_result.fluency_score}"
+            )
+            print("     Word-level details:")
+            for idx, word in enumerate(pronunciation_result.words):
+                print(f"     {idx + 1}. word: {word.word}\taccuracy: {word.accuracy_score}\terror type: {word.error_type};")
+
+    def canceled_cb(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs):
+        if evt.result.reason == speechsdk.ResultReason.Canceled:
+            cancellation_details = evt.result.cancellation_details
+            print(f"Cancellation details: {cancellation_details.reason.CancellationReason}")
+            if cancellation_details.reason == speechsdk.CancellationReason.Error:
+                print(f"Error details: {cancellation_details.error_details}")
+                self.recognition_done.set()
+
+    def stopped_cb(self, evt):
+        print(f"Azure session stopped: {evt.session_id}")
+        self.recognition_done.set()
 
 @app.api_route("/voice", methods=["GET", "POST"])
 async def voice_response(request: Request):
@@ -41,228 +122,109 @@ async def voice_response(request: Request):
 @app.websocket("/audio-stream")
 async def stream_audio(twilio_ws: WebSocket):
     await twilio_ws.accept()
+    
     stream_sid = None
-    # azure_stream, speech_recognizer, recognition_done = await configure_azure_speech()
-    # url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
+    # speech_recognizer = AzureSpeechRecognizer()
+    url = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17"
 
-    speech_config = speechsdk.SpeechConfig(subscription=speech_key, region=azure_region)
-
-    # set up audio input stream
-    audio_format = speechsdk.audio.AudioStreamFormat(
-        samples_per_second=8000,
-        bits_per_sample=16,
-        channels=1,
-        wave_stream_format=speechsdk.AudioStreamWaveFormat.MULAW
-    )
-    azure_stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
-    audio_config = speechsdk.audio.AudioConfig(stream=azure_stream)
-
-    # instantiate the speech recognizer
-    speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
-    recognition_done = asyncio.Event()
-
-    # pronunciation assessment config
-    pronunciation_config = speechsdk.PronunciationAssessmentConfig(
-        grading_system=speechsdk.PronunciationAssessmentGradingSystem.HundredMark,
-        granularity=speechsdk.PronunciationAssessmentGranularity.Phoneme,
-        enable_miscue=True
-    )
-    pronunciation_config.apply_to(speech_recognizer)
-    print("Azure speech recognizer configured")
-
-    # define callbacks to handle events fired by the speech recognizer
-    def recognized(evt: speechsdk.SpeechRecognitionEventArgs):
-        if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
-            print(f"Pronunciation assessment for: {evt.result.text}")
-            pronunciation_result = speechsdk.PronunciationAssessmentResult(evt.result)
-            print(f"Accuracy: {pronunciation_result.accuracy_score} \n\n Prosody score: {pronunciation_result.prosody_score} \n\n Completeness score: {pronunciation_result.completeness_score} \n\n Fluency score: {pronunciation_result.fluency_score}")
-    def session_stopped(evt):
-        print(f"Session stopped: {evt.session_id}")
-        recognition_done.set()
-    def canceled(evt):
-        print(f"Canceled: {evt}")
-        if evt.reason == speechsdk.ResultReason.Canceled:
-            cancellation_details = evt.cancellation_details
-            print(f"Cancellation details: {cancellation_details}")
-            if cancellation_details.reason == speechsdk.CancellationReason.Error:
-                print(f"Error details: {cancellation_details.error_details}")
-        recognition_done.set()
-
-    # define functions to signal events fired by the speech recognizer
-    speech_recognizer.recognizing.connect(lambda evt: print(f"Recognizing: {evt.result.text}"))
-    speech_recognizer.recognized.connect(recognized)
-    speech_recognizer.session_started.connect(lambda evt: print(f"Session started: {evt}"))
-    speech_recognizer.session_stopped.connect(session_stopped)
-    speech_recognizer.canceled.connect(lambda evt: print(f"Canceled: {evt}"))
-
-    async def send_azure(audio):
-        # print("Sending audio to Azure...")
-        # def mulaw_to_pcm(mulaw_bytes: bytes) -> bytes:
-        #     BIAS = 0x84
-
-        #     def decode_byte(mu):
-        #         mu = ~mu & 0xFF
-        #         sign = mu & 0x80
-        #         exponent = (mu >> 4) & 0x07
-        #         mantissa = mu & 0x0F
-        #         sample = ((mantissa << 4) + 0x08) << exponent
-        #         sample -= BIAS
-        #         return -sample if sign else sample
-
-        #     pcm_samples = [decode_byte(b) for b in mulaw_bytes]
-        #     return bytes(np.array(pcm_samples, dtype=np.int16).tobytes())
-        
-        # pcm_audio = mulaw_to_pcm(base64_audio)
-        
-        try:
-            azure_stream.write(audio)
-        except Exception as e:
-            print(f"Error writing to Azure stream: {e}")
-
-    speech_recognizer.start_continuous_recognition()
-    print("Speech recognizer started")
-
-    # start the speech recognizer
     try:
-        async for message in twilio_ws.iter_text():
-            data = json.loads(message)
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(
+                url,
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "OpenAI-Beta": "realtime=v1"
+                }
+            ) as openai_ws:
+                await update_default_session(openai_ws)
 
-            match data["event"]:
-                case "connected":
-                    print("Connected to Twilio media stream")
-                case "start":
-                    print("Twilio stream has started")
-                    stream_sid = data["start"]["streamSid"]
-                    print("Stream SID:", stream_sid)
-                    
-                case "media":
-                    base64_audio = base64.b64decode(data["media"]["payload"])
-                    azure_task = asyncio.create_task(send_azure(base64_audio))
-                    await asyncio.gather(azure_task)
-                    # audio_byte = {
-                    #     "type": "input_audio_buffer.append",
-                    #     "audio": base64_audio
-                    # }
-                    # await openai_ws.send_json(audio_byte)
-                    # openai_task = asyncio.create_task(send_to_openai(openai_ws, base64_audio))
-                    # azure_task = asyncio.create_task(send_to_azure(azure_stream, base64_audio))
-                    # await asyncio.gather(openai_task, azure_task)
-                case "stop":
-                    print("Twilio stream has stopped")
-                    # await openai_ws.close()
-    except WebSocketDisconnect:
-        print("Twilio webSocket disconnected")
-        # if not openai_ws.closed:
-        #     print("Closing OpenAI WebSocket")
-        #     await openai_ws.close()
-    finally:
-        print("finally block executed")
-        azure_stream.close()
-        print("Azure stream closed")
-        await recognition_done.wait()
-        speech_recognizer.stop_continuous_recognition()
-        print("Speech recognizer stopped")
-        
+                # receive and process Twilio audio
+                async def receive_twilio_stream():
+                    nonlocal stream_sid
 
-    # try:
-    #     async with aiohttp.ClientSession() as session:
-    #         async with session.ws_connect(
-    #             url,
-    #             headers={
-    #                 "Authorization": f"Bearer {openai_key}",
-    #                 "OpenAI-Beta": "realtime=v1"
-    #             }
-    #         ) as openai_ws:
-    #             await update_default_session(openai_ws)
+                    try:
+                        async for message in twilio_ws.iter_text():
+                            data = json.loads(message)
 
-    #             async def receive_twilio_stream():
-    #                 try:
-    #                     async for message in twilio_ws.iter_text():
-    #                         data = json.loads(message)
-
-    #                         match data["event"]:
-    #                             case "connected":
-    #                                 print("Connected to Twilio media stream")
-    #                             case "start":
-    #                                 print("Twilio stream has started")
-    #                                 stream_sid = data["start"]["streamSid"]
-    #                                 print("Stream SID:", stream_sid)
-    #                                 speech_recognizer.start_continuous_recognition()
-    #                                 print("Speech recognizer started")
-    #                             case "media":
-    #                                 base64_audio = data["media"]["payload"]
-    #                                 # audio_byte = {
-    #                                 #     "type": "input_audio_buffer.append",
-    #                                 #     "audio": base64_audio
-    #                                 # }
-    #                                 # await openai_ws.send_json(audio_byte)
-    #                                 openai_task = asyncio.create_task(send_to_openai(openai_ws, base64_audio))
-    #                                 azure_task = asyncio.create_task(send_to_azure(azure_stream, base64_audio))
-    #                                 await asyncio.gather(openai_task, azure_task)
-    #                             case "stop":
-    #                                 print("Twilio stream has stopped")
+                            match data["event"]:
+                                case "connected":
+                                    print("Connected to Twilio media stream")
+                                case "start":
+                                    stream_sid = data["start"]["streamSid"]
+                                    print("Twilio stream started:", stream_sid)
                                     
-    #                                 await openai_ws.close()
-    #                 except WebSocketDisconnect:
-    #                     if not openai_ws.closed:
-    #                         print("Closing OpenAI WebSocket")
-    #                         await openai_ws.close()
+                                    # speech_recognizer.start_recognition()
+                                case "media":
+                                    base64_audio = data["media"]["payload"]
+                                    mulaw_audio = base64.b64decode(base64_audio)
 
-    #             async def send_ai_response():
-    #                 try:
-    #                     async for ws_message in openai_ws:
-    #                         openai_response = json.loads(ws_message.data)
+                                    openai_task = asyncio.create_task(send_to_openai(openai_ws, base64_audio))
+                                    # azure_task = asyncio.create_task(speech_recognizer.send_to_azure(mulaw_audio))
+                                    await asyncio.gather(openai_task)
+                                case "stop":
+                                    print("Twilio stream has stopped")
+                    except WebSocketDisconnect:
+                        print("Twilio webSocket disconnected")
+                    finally:
+                        # speech_recognizer.stream.close()
+                        print("Azure stream closed")
+                        # speech_recognizer.stop_recognition()
+                        if not openai_ws.closed:
+                            print("Closing OpenAI WebSocket...")
+                            await openai_ws.close()
 
-    #                         if ws_message.type == aiohttp.WSMsgType.TEXT:
-    #                             print("wsmessage.text: \n\n", openai_response)
-    #                             if openai_response["type"] == "error":
-    #                                 print("Error in OpenAI response:", openai_response["error"])
-    #                             if openai_response["type"] == "input_audio_buffer.speech_started":
-    #                                 print("Speech started")
-    #                                 await twilio_ws.send_json({
-    #                                     "event": "clear",
-    #                                     "streamSid": stream_sid
-    #                                 })
-    #                             if openai_response["type"] == "input_audio_buffer.speech_stopped":
-    #                                 print("Speech stopped")
-    #                                 azure_stream.close()
-    #                                 await recognition_done.wait()
-    #                                 speech_recognizer.stop_continuous_recognition()
-    #                                 print("Speech recognizer stopped")
-    #                         if ws_message.type == aiohttp.WSMsgType.BINARY:
-    #                             print("wsmessage.binary: \n")
+                # send AI response to Twilio
+                async def send_ai_response():
+                    nonlocal stream_sid
 
-    #                             if openai_response["type"] == "response.audio.delta":
-    #                                     print("ai audio response:", openai_response["delta"])
-    #                                     audio_payload = base64.b64encode(base64.b64decode(openai_response["delta"])).decode("utf-8")
-    #                                     audio_data = {
-    #                                         "event": "media",
-    #                                         "streamSid": stream_sid,
-    #                                         "media": {
-    #                                             "payload": audio_payload
-    #                                         }
-    #                                     }
+                    try:
+                        async for ws_message in openai_ws:
+                            openai_response = json.loads(ws_message.data)
 
-    #                                     await twilio_ws.send_json(audio_data)
-    #                                     print("Audio data sent to Twilio WebSocket")
+                            if ws_message.type == aiohttp.WSMsgType.TEXT:
+                                # print("wsmessage.text: \n\n", openai_response)
+                                if openai_response["type"] == "error":
+                                    print("Error in OpenAI response:", openai_response["error"])
+                                if openai_response["type"] == "input_audio_buffer.speech_started":
+                                    print("Speech started")
+                                    await twilio_ws.send_json({
+                                        "event": "clear",
+                                        "streamSid": stream_sid
+                                    })
+                                if openai_response["type"] == "input_audio_buffer.speech_stopped":
+                                    print("Speech stopped")
 
-    #                                     mark_message = {
-    #                                         "event": "mark",
-    #                                         "streamSid": stream_sid,
-    #                                         "mark": { "name": "ai response" }
-    #                                     }
+                                if openai_response["type"] == "response.audio.delta":
+                                        # print("ai audio response:", openai_response["delta"])
+                                        audio_payload = base64.b64encode(base64.b64decode(openai_response["delta"])).decode("utf-8")
+                                        audio_data = {
+                                            "event": "media",
+                                            "streamSid": stream_sid,
+                                            "media": {
+                                                "payload": audio_payload
+                                            }
+                                        }
 
-    #                                     await twilio_ws.send_json(mark_message)
-    #                                     print("Mark message sent to Twilio WebSocket")
-    #                         if openai_response["type"] == "response.audio.delta":
-    #                             print("ai audo response recieved.")
-    #                 except Exception as e:
-    #                     print(f"Error in send_ai_response: {e}")
+                                        await twilio_ws.send_json(audio_data)
+                                        # print("\n\nAudio data sent to Twilio WebSocket:", audio_data)
 
-    #             await asyncio.gather(receive_twilio_stream(), send_ai_response())
-    # except Exception as e:
-    #     print("Error in aiohttp Websocket connection:", e)
-    #     await twilio_ws.close()
+                                        mark_message = {
+                                            "event": "mark",
+                                            "streamSid": stream_sid,
+                                            "mark": { "name": "ai response" }
+                                        }
+
+                                        await twilio_ws.send_json(mark_message)
+                                        print("Mark message sent to Twilio WebSocket")
+                            # if openai_response["type"] == "response.audio.delta":
+                            #     print("ai audo response recieved:", ws_message)
+                    except Exception as e:
+                        print(f"Error in send_ai_response: {e}")
+
+                await asyncio.gather(receive_twilio_stream(), send_ai_response())
+    except Exception as e:
+        print("Error in aiohttp Websocket connection:", e)
+        await twilio_ws.close()
 
 async def send_to_openai(openai_ws, base64_audio):
     audio_byte = {
@@ -270,25 +232,6 @@ async def send_to_openai(openai_ws, base64_audio):
         "audio": base64_audio
     }
     await openai_ws.send_json(audio_byte)
-
-async def send_to_azure(stream, base64_audio):
-    try:
-        stream.write(base64_audio)
-    except Exception as e:
-        print(f"Error writing to Azure stream: {e}")
-
-# async def configure_azure_speech():
-#     # configure azure speech service
-    
-
-#     return azure_stream, speech_recognizer, recognition_done
-
-async def analyze_pronunciation(recognition_done):
-    print("Analyzing pronunciation...")
-
-    # wait for the recognition to finish
-    await recognition_done.wait()
-    
 
 async def update_default_session(openai_ws):
     session_update = {
@@ -311,6 +254,39 @@ async def update_default_session(openai_ws):
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
+
+
+# try:
+#     async for message in twilio_ws.iter_text():
+#         data = json.loads(message)
+
+#         match data["event"]:
+#             case "connected":
+#                 print("Connected to Twilio media stream")
+#             case "start":
+#                 print("Twilio stream has started")
+#                 stream_sid = data["start"]["streamSid"]
+#                 print("Stream SID:", stream_sid)
+#                 speech_recognizer.start_continuous_recognition()
+#                 print("Speech recognizer started")
+#             case "media":
+#                 base64_audio = data["media"]["payload"]
+#                 # audio_byte = {
+#                 #     "type": "input_audio_buffer.append",
+#                 #     "audio": base64_audio
+#                 # }
+#                 # await openai_ws.send_json(audio_byte)
+#                 openai_task = asyncio.create_task(send_to_openai(openai_ws, base64_audio))
+#                 azure_task = asyncio.create_task(send_to_azure(azure_stream, base64_audio))
+#                 await asyncio.gather(openai_task, azure_task)
+#             case "stop":
+#                 print("Twilio stream has stopped")
+                
+#                 await openai_ws.close()
+#     except WebSocketDisconnect:
+#         if not openai_ws.closed:
+#             print("Closing OpenAI WebSocket")
+#             await openai_ws.close()
 
 
 # @app.websocket("/stream")

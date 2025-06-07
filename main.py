@@ -27,6 +27,8 @@ NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER_SID = os.getenv("TWILIO_NUMBER_SID")
+TWILIO_SANDBOX_NUMBER = os.getenv("TWILIO_SANDBOX_NUMBER")
+WHATSAPP_PHONE_NUMBER = os.getenv("WHATSAPP_PHONE_NUMBER")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -238,11 +240,11 @@ async def send_analysis(request: Request):
         else:
             message_body = "No assessment results available for your latest session."
             
-        call = client.calls(form_data["CallSid"]).fetch()
+        # call = client.calls(form_data["CallSid"]).fetch()
         message = client.messages.create(
             body=message_body,
-            from_=call.to,
-            to=call._from,
+            from_=f"whatsapp:{TWILIO_SANDBOX_NUMBER}",
+            to=f"whatsapp:{WHATSAPP_PHONE_NUMBER}",
             status_callback=f"https://{request.url.hostname}/message-status"
         )
         print("Message SID:", message.sid)
